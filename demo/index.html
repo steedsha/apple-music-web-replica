@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Apple Music 网页版 · 流体背景复刻 Demo</title>
+<!--
+  Apple Music 网页版「全屏播放器流体背景」复刻 Demo —— 原生 WebGL、零依赖，
+  双击即可打开，无需构建。播放界面为仿官方布局的静态示意（播放/暂停键可控制背景动画），
+  封面来自 Apple CDN 在线资源，也支持拖入 / 粘贴本地图片。
+  完整的实现分析、参数依据与官方对比素材见仓库 README 与 docs/实现解析.md。
+
+  渲染管线依据（对照 Apple 线上渲染脚本逐项核对，并参考公开还原资料）：
+    · aadishv 对该背景渐变的效果分析与开源还原:  github.com/aadishv/html-music（bundle.ts）
+    · 2026-10-04 与 Apple 线上下发的全屏播放器渲染脚本（scene 模块）逐行核对：
+        四层精灵 1.25w/0.8w/0.5w/0.25w、转速 +.003/−.008/−.006/+.004、轨道相位 ×0.75、
+        Twist angle −3.25 / radius 900 全部一致；另有七点公开资料未覆盖、本实现已落实的细节：
+          1) 模糊的真身：5 个 Ee 滤镜（内嵌的 v4 系 BlurFilter，uOffset + _kernels，
+             不是 pixi.js v7 的 BlurFilter！）——每 pass 只采 4 个对角角点求平均（box 核），
+             kernels = [blur, blur−blur/q, ...] 递减，offset = kernels[p]+0.5 纹素；
+             链 (5,1)(10,1)(20,2)(40,2)(80,2) 展开 = 7 道全分辨率 pass：
+             5.5 / 10.5 / 20.5,10.5 / 40.5,20.5 / 80.5,40.5。
+             递减 box 扩散的中间频保留 = 「水墨晕染」质感的真正来源
+          2) AdjustmentFilter 不止 saturation 2.75，还有 brightness 0.7 + contrast 1.9
+             （官方公式: rgb = mix(vec3(.5), mix(luma, rgb, sat), con) * bri）
+          3) 换歌 = 旧精灵瞬间移除，新精灵 alpha 每帧 ±0.02（≈1.65s）从舞台白色底上
+             淡入（经罩层后是浅灰），不是流体间交叉淡化；且适配 prefers-reduced-motion
+          4) 流体特效之上还叠了全屏罩层：黑 50% + 白 5% —— 动态范围压半，
+             这是「Apple 的漩涡看不出来」的关键；本 demo 已按 rgb*0.475+0.05 复刻
+          5) 轨道公转的两个小精灵显示自转取负号（i[2].rotation=-o[2]）——自转与公转
+             逆行，texture 相对轨道翻滚（水流感来源之一）；且 ticker.maxFPS=15，
+             流体背景是 15fps 更新（步进黏稠感，实测 14.9fps），本 demo 已复刻、面板可关
+          6) 滤镜链的 frame 出屏扩展（padding = Σkernels ≈ 229px）：画面边缘的模糊
+             采的是屏外真实内容；本 demo 用 margin=384 复刻
+          7) ★ 传给场景的封面纹理是 40×40 的 webp 缩略图！
+             （backdrop 组件: Go(artwork.url, {width:40, height:40, crop:'bb', fileType:'webp'})）
+             40×40 色板放大 40 倍 = 天然无内部细节的纯色彩晕染 —— 这是「水墨感」的
+             最终来源，比模糊算法更重要。喂原尺寸封面会细节穿透模糊层，观感立刻不同
+        本文件用原生 WebGL 复刻，不依赖 Pixi。
+
+  播放界面（封面 / 进度条 / 传输控制 / 音量）为仿官方布局的静态示意。
+  界面图标样式参考 Material Symbols（Apache-2.0）。
+-->
+<style>
+  :root {
+    --ui-font: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    font-family: var(--ui-font);
+    background: #0a0a0c;
+    color: #fff;
+    user-select: none;
+  }
+
+  /* ── L1 流体背景（WebGL canvas，铺满） ── */
+  #fluid {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* ── L2 播放界面（仿官方全屏播放布局：居中封面 + 控制区） ── */
+  .stage {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .player {
+    width: min(58vh, 36vw, 640px);
+    pointer-events: auto;
+  }
+  .art {
+    width: 100%;
+    aspect-ratio: 1/1;
+    border-radius: 8px;
+    box-shadow: 0 24px 80px rgba(0,0,0,.5);
+    background-size: cover;
+    background-position: center;
+    transition: opacity 2.2s ease;
+  }
+  .meta-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-top: 20px;
+  }
+  .np-title {
+    font-size: clamp(18px, 2.4vh, 24px);
+    font-weight: 700;
+    letter-spacing: .2px;
+  }
+  .np-artist {
+    margin-top: 4px;
+    font-size: clamp(13px, 1.7vh, 16px);
+    color: rgba(255,255,255,.72);
+  }
+  .meta-actions { display: flex; gap: 10px; flex: none; }
+  .circle-btn {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(28,28,32,.5);
+    color: rgba(255,255,255,.9);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+  .circle-btn:hover { background: rgba(50,50,56,.6); }
+  .circle-btn svg { width: 18px; height: 18px; fill: currentColor; }
+
+  .progress {
+    margin-top: 20px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(255,255,255,.4);
+  }
+  .times {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 6px;
+    font-size: 11.5px;
+    color: rgba(255,255,255,.62);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .transport {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 30px;
+    margin-top: 14px;
+  }
+  .transport button {
+    border: none;
+    background: none;
+    color: #fff;
+    opacity: .92;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    padding: 4px;
+  }
+  .transport button:hover { opacity: 1; }
+  .transport svg { width: 22px; height: 22px; fill: currentColor; }
+  .transport .play svg { width: 42px; height: 42px; }
+
+  .volume {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 14px;
+    color: rgba(255,255,255,.85);
+  }
+  .volume svg { width: 16px; height: 16px; fill: currentColor; flex: none; }
+  .volume input[type=range] { flex: 1; accent-color: #fff; height: 3px; }
+
+  .close-btn {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    z-index: 5;
+    border: none;
+    background: none;
+    color: #fff;
+    opacity: .9;
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    padding: 6px;
+    pointer-events: auto;
+  }
+  .close-btn:hover { opacity: 1; }
+  .close-btn svg { width: 26px; height: 26px; fill: currentColor; }
+
+  body.no-ui .stage, body.no-ui .close-btn { display: none; }
+
+  /* ── 控制面板 ── */
+  .panel {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    width: 300px;
+    max-height: calc(100vh - 28px);
+    overflow-y: auto;
+    background: rgba(18,18,24,.72);
+    backdrop-filter: blur(22px) saturate(1.3);
+    -webkit-backdrop-filter: blur(22px) saturate(1.3);
+    border: 1px solid rgba(255,255,255,.10);
+    border-radius: 14px;
+    padding: 14px 16px 12px;
+    font-size: 12.5px;
+    z-index: 10;
+    pointer-events: auto;
+    box-shadow: 0 10px 40px rgba(0,0,0,.4);
+  }
+  .panel.hidden { display: none; }
+  .panel h2 { font-size: 13px; font-weight: 700; opacity: .9; margin-bottom: 2px; }
+  .panel .src { font-size: 10.5px; line-height: 1.5; opacity: .48; margin-bottom: 10px; }
+  .panel .src a { color: #7db4ff; text-decoration: none; }
+
+  .grp { margin: 10px 0 2px; font-size: 11px; font-weight: 700; letter-spacing: .8px; opacity: .55; text-transform: uppercase; }
+
+  .tracks { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 6px 0 4px; }
+  .tracks button {
+    display: flex; align-items: center; gap: 7px;
+    background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.09);
+    color: #fff; border-radius: 8px;
+    padding: 5px 7px; font: 11.5px var(--ui-font);
+    cursor: pointer; text-align: left;
+  }
+  .tracks button:hover { background: rgba(255,255,255,.14); }
+  .tracks button.on { border-color: rgba(255,255,255,.55); background: rgba(255,255,255,.16); }
+  .tracks button i {
+    width: 20px; height: 20px; border-radius: 4px; flex: none;
+    background-size: cover; background-position: center;
+  }
+
+  .row { display: flex; align-items: center; gap: 8px; margin: 7px 0; }
+  .row label { flex: none; width: 88px; opacity: .75; }
+  .row output { flex: none; width: 46px; text-align: right; opacity: .6; font-variant-numeric: tabular-nums; }
+  .row input[type=range] { flex: 1; accent-color: #fff; height: 14px; }
+
+  .toggles { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .toggles button {
+    background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.09);
+    color: #fff; border-radius: 7px;
+    padding: 4px 10px; font: 11.5px var(--ui-font); cursor: pointer;
+  }
+  .toggles button.on { border-color: rgba(255,255,255,.55); background: rgba(255,255,255,.18); }
+
+  .actions { display: flex; gap: 6px; margin-top: 8px; }
+  .actions button {
+    flex: 1;
+    background: rgba(255,255,255,.10);
+    border: 1px solid rgba(255,255,255,.10);
+    color: #fff; border-radius: 7px;
+    padding: 6px 4px; font: 11.5px var(--ui-font); cursor: pointer;
+  }
+  .actions button:hover { background: rgba(255,255,255,.18); }
+
+  .fps { margin-top: 8px; font-size: 11px; opacity: .55; font-variant-numeric: tabular-nums; }
+  .hint { margin-top: 6px; font-size: 10.5px; opacity: .45; line-height: 1.6; }
+
+  .panel-toggle {
+    position: fixed; top: 14px; right: 14px; z-index: 11;
+    width: 34px; height: 34px; border-radius: 10px;
+    background: rgba(18,18,24,.72);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,.12);
+    color: #fff; font-size: 15px; cursor: pointer;
+    display: none;
+  }
+  body.panel-off .panel-toggle { display: block; }
+  body.panel-off .panel { display: none; }
+
+  .drop-tip {
+    position: fixed; inset: 0; z-index: 20;
+    display: none; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45); border: 2px dashed rgba(255,255,255,.5);
+    font-size: 22px; letter-spacing: 2px;
+  }
+  body.dropping .drop-tip { display: flex; }
+</style>
+</head>
+<body>
+<canvas id="fluid"></canvas>
+
+<button class="close-btn" id="btnClose" title="关闭播放界面">
+  <svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+</button>
+
+<main class="stage">
+  <section class="player">
+    <div class="art" id="npArt"></div>
+
+    <div class="meta-row">
+      <div class="meta">
+        <div class="np-title" id="npTitle">—</div>
+        <div class="np-artist" id="npArtist">—</div>
+      </div>
+      <div class="meta-actions">
+        <button class="circle-btn" title="收藏">
+          <svg viewBox="0 0 24 24"><path d="M22 9.24l-7.19-.62L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.63-7.03L22 9.24zM12 15.4l-3.76 2.27 1-4.28-3.32-2.88 4.38-.38L12 6.1l1.71 4.04 4.38.38-3.32 2.88 1 4.28L12 15.4z"/></svg>
+        </button>
+        <button class="circle-btn" title="更多">
+          <svg viewBox="0 0 24 24"><path d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="progress"></div>
+    <div class="times"><span>0:00</span><span>-0:00</span></div>
+
+    <div class="transport">
+      <button title="随机播放">
+        <svg viewBox="0 0 24 24"><path d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"/></svg>
+      </button>
+      <button title="上一首">
+        <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+      </button>
+      <button class="play" id="btnPlay" title="播放 / 暂停（空格）">
+        <svg viewBox="0 0 24 24" id="iconPlay" style="display:none"><path d="M8 5v14l11-7z"/></svg>
+        <svg viewBox="0 0 24 24" id="iconPause"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+      </button>
+      <button title="下一首">
+        <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+      </button>
+      <button title="重复播放">
+        <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+      </button>
+    </div>
+
+    <div class="volume">
+      <svg viewBox="0 0 24 24"><path d="M18.5 12A4.5 4.5 0 0 0 16 7.97v8.05A4.47 4.47 0 0 0 18.5 12zM5 9v6h4l5 5V4L9 9H5z"/></svg>
+      <input type="range" id="volSlider" min="0" max="100" value="70">
+    </div>
+  </section>
+</main>
+
+<div class="drop-tip">松开即可换成这张封面</div>
+<button class="panel-toggle" id="panelToggle" title="打开控制面板">⚙</button>
+
+<aside class="panel" id="panel">
+  <h2>Apple Music 流体背景 · Demo</h2>
+  <div class="src">
+    基于 <a href="https://www.aadishv.dev/music" target="_blank">aadishv 对 Apple Music 网页版背景渐变的效果分析</a>
+    与开源还原（<a href="https://github.com/aadishv/html-music" target="_blank">aadishv/html-music</a>），
+    并对照 Apple 线上渲染脚本核对了 7 处公开资料未覆盖的实现细节（见仓库 docs/实现解析.md）。
+    原生 WebGL 零依赖，双击即开。
+  </div>
+
+  <div class="grp">曲目（点击换封面看效果）</div>
+  <div class="tracks" id="trackBtns"></div>
+  <div class="actions">
+    <button id="btnOpen">打开本地图片…</button>
+    <input type="file" id="fileInput" accept="image/*" style="display:none">
+  </div>
+
+  <div class="grp">效果参数（Apple 原值已标默认）</div>
+  <div class="row"><label>扭曲角度</label><input type="range" id="pAngle" min="-8" max="8" step="0.05" value="-3.25"><output id="oAngle">-3.25</output></div>
+  <div class="row"><label>扭曲半径</label><input type="range" id="pRadius" min="200" max="2200" step="10" value="900"><output id="oRadius">900</output></div>
+  <div class="row"><label>模糊倍率</label><input type="range" id="pBlur" min="0.25" max="2" step="0.05" value="1"><output id="oBlur">1.00</output></div>
+  <div class="row"><label>饱和度</label><input type="range" id="pSat" min="1" max="4" step="0.05" value="2.75"><output id="oSat">2.75</output></div>
+  <div class="row"><label>对比度</label><input type="range" id="pCon" min="1" max="3" step="0.05" value="1.9"><output id="oCon">1.90</output></div>
+  <div class="row"><label>亮度</label><input type="range" id="pBri" min="0.3" max="1.2" step="0.01" value="0.7"><output id="oBri">0.70</output></div>
+  <div class="row"><label>流速倍率</label><input type="range" id="pSpeed" min="0.2" max="3" step="0.05" value="1"><output id="oSpeed">1.0</output></div>
+  <div class="row"><label>交叉淡入</label><input type="range" id="pFade" min="0" max="4000" step="50" value="1650"><output id="oFade">1650</output></div>
+
+  <div class="grp">开关</div>
+  <div class="toggles">
+    <button id="tPause">暂停（空格）</button>
+    <button id="tUi" class="on">播放界面</button>
+    <button id="tFps15" class="on" title="对照线上版本确认：ticker.maxFPS=15，流体背景 15fps 更新">原版 15fps</button>
+    <button id="tHide">收起面板</button>
+  </div>
+
+  <div class="fps" id="fps">FPS —</div>
+  <div class="hint">
+    快捷键：空格播放 / 暂停 · 数字键切曲目 · H 收起面板<br>
+    支持把任意图片拖进窗口 / Ctrl+V 粘贴当封面
+  </div>
+</aside>
+
+<script>
+'use strict';
+
+/* ════════════════════════════════════════════════════════════════════
+   0. 曲目与封面来源（Apple CDN 在线封面；本地图片经 文件选择 / 拖拽 / 粘贴 导入）
+   ════════════════════════════════════════════════════════════════════ */
+
+const TRACKS = [
+  { title: 'PRIMA',       artist: 'ADÉLA',
+    url: 'https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/5d/77/7b/5d777b87-e796-0b3e-cef6-d37d993dd8fe/26UMGIM82371.rgb.jpg/600x600bb.jpg' },
+  { title: 'stupid song', artist: 'Olivia Rodrigo',
+    url: 'https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/1d/1b/f9/1d1bf9b1-44c6-9a6c-6ffb-c158488c06ce/26UMGIM39303.rgb.jpg/600x600bb.jpg' },
+  { title: 'bloodstream', artist: 'Alyssa Grace',
+    url: 'https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/7f/a7/ef/7fa7ef61-6e22-f30f-441c-e89e7ff4a79a/093624817147.jpg/600x600bb.jpg' },
+  { title: 'White Keys',  artist: 'Dominic Fike',
+    url: 'https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/0c/5a/ef/0c5aef1c-6929-76c8-d9cb-9c8e9c5537fa/196873758947.jpg/600x600bb.jpg' },
+  { title: 'Midnight Sun', artist: 'Zara Larsson',
+    url: 'https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/fb/1d/2d/fb1d2d1c-0f79-53ad-ab9b-ac20918b5856/196873177199.jpg/600x600bb.jpg' },
+  { title: 'Nobody Wanna Dance Anymore', artist: 'Tinashe — Popstar',
+    url: 'https://is1-ssl.mzstatic.com/image/thumb/Music211/v4/33/26/5a/33265a39-a36e-9455-716c-0e63a9173b29/075679570758.jpg/600x600bb.jpg' },
+];
+
+/* ════════════════════════════════════════════════════════════════════
+   1. WebGL 管线（全部对照 Apple 线上渲染脚本逐行核对）
+      pass1  合成：4 层精灵画进 FBO；换歌 = 旧精灵瞬间移除，新流体在白色底上淡入
+      pass2  扭曲：Pixi TwistFilter 公式（半径内按 ((r-d)/r)² × angle 旋转坐标，
+             采样系 y 向上，角度取负与 Apple 的 y 向下屏幕系对齐）
+      pass3  Ee 模糊：4 角点 box + 递减 kernels（5.5/10.5/20.5,10.5/40.5,20.5/80.5,40.5，
+             共 7 道 pass）—— 水墨质感的真正来源，见 pass3 处详细注释
+      pass4  末段顺带做 AdjustmentFilter（sat 2.75 / con 1.9 / bri 0.7，先 clamp 再叠
+             黑 50% + 白 5% 罩层）并输出到屏幕；frame 比视口大 M=208，末段裁剪
+   ════════════════════════════════════════════════════════════════════ */
+
+const canvas = document.getElementById('fluid');
+// 与 Apple 线上实现一致：powerPreference low-power（模糊链是大面积填充，集显足够，省电）
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'low-power' });
+if (!gl) document.body.innerHTML = '<p style="padding:40px">WebGL 不可用</p>';
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(sh) + '\n' + src);
+  }
+  return sh;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+/* --- 全屏 quad（后处理各 pass 共用）：NDC 坐标 + uv --- */
+const fsQuad = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, fsQuad);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+  -1, -1, 0, 0,  1, -1, 1, 0,  -1, 1, 0, 1,
+  -1, 1, 0, 1,   1, -1, 1, 0,   1, 1, 1, 1,
+]), gl.STATIC_DRAW);
+
+/* --- pass1：精灵合成 --- */
+const spriteVS = `
+  attribute vec2 a_pos;    // 屏幕像素坐标（y 向下）
+  attribute vec2 a_uv;
+  attribute float a_alpha;
+  uniform vec2 u_res;
+  varying vec2 v_uv;
+  varying float v_alpha;
+  void main() {
+    vec2 ndc = a_pos / u_res * 2.0 - 1.0;
+    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+    v_uv = a_uv;
+    v_alpha = a_alpha;
+  }`;
+const spriteFS = `
+  precision mediump float;
+  uniform sampler2D u_tex;
+  varying vec2 v_uv;
+  varying float v_alpha;
+  void main() {
+    vec3 rgb = texture2D(u_tex, v_uv).rgb;
+    gl_FragColor = vec4(rgb * v_alpha, v_alpha); // 预乘 alpha，交叉淡入用 premultiplied over
+  }`;
+const progSprite = program(spriteVS, spriteFS);
+const U = {
+  res: gl.getUniformLocation(progSprite, 'u_res'),
+  tex: gl.getUniformLocation(progSprite, 'u_tex'),
+};
+const A = {
+  pos: gl.getAttribLocation(progSprite, 'a_pos'),
+  uv: gl.getAttribLocation(progSprite, 'a_uv'),
+  alpha: gl.getAttribLocation(progSprite, 'a_alpha'),
+};
+
+/* --- pass2：Twist（Pixi pixi-filters 的 TwistFilter 公式） --- */
+const twistFS = `
+  precision highp float;
+  uniform sampler2D u_tex;
+  uniform vec2 u_res;      // 源 FBO 尺寸(px)
+  uniform vec2 u_center;   // 扭曲中心(px)
+  uniform float u_radius;  // 扭曲半径(px)
+  uniform float u_angle;   // 最大扭曲角(rad，中心处 = 2×该值)
+  varying vec2 v_uv;
+  void main() {
+    vec2 coord = v_uv * u_res - u_center;
+    float dist = length(coord);
+    float t = clamp((u_radius - dist) / u_radius, 0.0, 1.0);
+    float a = u_angle * t * t; // @pixi/filter-twist v5 官方公式：ratioDist² × angle（无系数）
+    float ca = cos(a), sa = sin(a);
+    coord = mat2(ca, sa, -sa, ca) * coord;
+    gl_FragColor = texture2D(u_tex, (coord + u_center) / u_res);
+  }`;
+const progTwist = program(`attribute vec2 a_p;attribute vec2 a_t;varying vec2 v_uv;
+  void main(){v_uv=a_t;gl_Position=vec4(a_p,0.,1.);}`, twistFS);
+const TU = {
+  tex: gl.getUniformLocation(progTwist, 'u_tex'),
+  res: gl.getUniformLocation(progTwist, 'u_res'),
+  center: gl.getUniformLocation(progTwist, 'u_center'),
+  radius: gl.getUniformLocation(progTwist, 'u_radius'),
+  angle: gl.getUniformLocation(progTwist, 'u_angle'),
+};
+
+/* --- pass3：Apple 渲染脚本中 Ee 滤镜的逐 pass 复刻 ---
+   ⚠️ 它不是 pixi.js v7 的 BlurFilter，而是内嵌的 v4 系 BlurFilter（uOffset + _kernels）：
+   每 pass 只采 4 个对角角点求平均（box 核！），offset = kernels[p] + 0.5 纹素，
+   kernels = [blur, blur-blur/q, blur-2blur/q, ...] 递减序列。
+   Apple 的链 (5,1)(10,1)(20,2)(40,2)(80,2) 展开为 7 道 pass：
+     5.5 / 10.5 / 20.5,10.5 / 40.5,20.5 / 80.5,40.5
+   递减的 box 扩散有独特的中间频保留 —— 这才是「水墨」质感的真正来源，
+   等效高斯（包括我此前的高斯链）出不来这个手感。 */
+const blurBoxFS = `
+  precision mediump float;
+  uniform sampler2D u_tex;
+  uniform vec2 u_texel;    // 1/帧尺寸
+  uniform float u_off;     // (kernel + 0.5) 纹素
+  uniform vec2 u_uv0;      // 末段输出到屏幕时的裁剪窗口（filter frame 出屏扩展）
+  uniform vec2 u_uvScale;
+  uniform float u_final;
+  uniform float u_sat;
+  uniform float u_con;
+  uniform float u_bri;
+  varying vec2 v_uv;
+  void main() {
+    vec2 uv = u_uv0 + v_uv * u_uvScale;
+    vec2 o = vec2(u_off) * u_texel;
+    vec4 c = texture2D(u_tex, uv + vec2(-o.x, o.y));
+    c += texture2D(u_tex, uv + vec2(o.x, o.y));
+    c += texture2D(u_tex, uv + vec2(o.x, -o.y));
+    c += texture2D(u_tex, uv + vec2(-o.x, -o.y));
+    c *= 0.25;
+    if (u_final > 0.5) {
+      // @pixi/filter-adjustment 官方公式（gamma=1）：
+      // rgb = mix(vec3(.5), mix(luma, rgb, saturation), contrast) * brightness
+      vec3 rgb = c.rgb;
+      vec3 luma = vec3(dot(vec3(.2125, .7154, .0721), rgb));
+      rgb = mix(vec3(.5), mix(luma, rgb, u_sat), u_con) * u_bri;
+      // ⚠️ Pixi 里 Adjustment 是独立 pass，写 8-bit 中间纹理时在此截断到 [0,1]，
+      // 然后黑/白罩层才叠上去 —— 必须先 clamp 再罩层：
+      //   暗部：对比度会把黑色推成负数，不 clamp 的话 +0.05 白罩层底会被负值吃掉（G/B=0）
+      //   亮部：不 clamp 的话饱和红会以 >1 的值进罩层，红场过曝到 0.9（Apple 实测封顶 ≈0.525）
+      rgb = clamp(rgb, 0.0, 1.0);
+      // 对照线上版本确认：流体特效上再叠黑 50% + 白 5% 全屏罩层 ——
+      // 动态范围被压掉一半，漩涡结构被压到不可见（这就是它「看不出漩涡」的原因）
+      rgb = rgb * 0.475 + 0.05;
+      c = vec4(rgb, 1.0);
+    }
+    gl_FragColor = c;
+  }`;
+const progBlur = program(`attribute vec2 a_p;attribute vec2 a_t;varying vec2 v_uv;
+  void main(){v_uv=a_t;gl_Position=vec4(a_p,0.,1.);}`, blurBoxFS);
+const BU = {
+  tex: gl.getUniformLocation(progBlur, 'u_tex'),
+  texel: gl.getUniformLocation(progBlur, 'u_texel'),
+  off: gl.getUniformLocation(progBlur, 'u_off'),
+  uv0: gl.getUniformLocation(progBlur, 'u_uv0'),
+  uvScale: gl.getUniformLocation(progBlur, 'u_uvScale'),
+  final: gl.getUniformLocation(progBlur, 'u_final'),
+  sat: gl.getUniformLocation(progBlur, 'u_sat'),
+  con: gl.getUniformLocation(progBlur, 'u_con'),
+  bri: gl.getUniformLocation(progBlur, 'u_bri'),
+};
+
+function drawFullscreen(prog) {
+  gl.bindBuffer(gl.ARRAY_BUFFER, fsQuad);
+  const ap = gl.getAttribLocation(prog, 'a_p');
+  const at = gl.getAttribLocation(prog, 'a_t');
+  gl.enableVertexAttribArray(ap);
+  gl.vertexAttribPointer(ap, 2, gl.FLOAT, false, 16, 0);
+  gl.enableVertexAttribArray(at);
+  gl.vertexAttribPointer(at, 2, gl.FLOAT, false, 16, 8);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+/* --- FBO 管理 --- */
+function makeFBO(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+
+let W = 0, H = 0, FW = 0, FH = 0, M = 0;
+let fboComposite = null, fboTwist = null, fboTmpA = null, fboTmpB = null;
+function resize() {
+  W = canvas.clientWidth;
+  H = canvas.clientHeight;
+  if (W < 2 || H < 2) return;
+  canvas.width = W;
+  canvas.height = H;
+  // filter frame 出屏扩展：Apple 的 filter frame = 精灵 AABB + padding(Σkernels≈229)，
+  // 模糊在画面边缘采的是屏外真实内容；twist 在上下边缘的采样可达屏外 ~373px —— M 取 384
+  M = 384;
+  FW = W + 2 * M;
+  FH = H + 2 * M;
+  fboComposite = makeFBO(FW, FH);
+  fboTwist = makeFBO(FW, FH);
+  fboTmpA = makeFBO(FW, FH);
+  fboTmpB = makeFBO(FW, FH);
+}
+window.addEventListener('resize', resize);
+
+/* ════════════════════════════════════════════════════════════════════
+   2. 曲目 / 精灵状态（bundle.ts 的四层参数原样照搬）
+   ════════════════════════════════════════════════════════════════════ */
+
+/** 一首歌 = 一张纹理 + 4 个精灵的动画状态。rot 单位与 bundle.ts 相同：每 33.33ms 一帧。 */
+function makeTrackState(tex) {
+  return {
+    tex,
+    // [t, s, i, r] 尺寸 = 视口宽 × [1.25, 0.8, 0.5, 0.25]；转速/正负见 tick()（与 Apple 逐值对应）
+    rot: [Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28],
+    size: [1.25, 0.8, 0.5, 0.25],
+    // t 在屏幕中心，s 在 (w/2.5, h/2.5)，i / r 公转（r 的圆心偏 (0.05w, 0.05w)）
+    pos: [null, null, null, null],
+  };
+}
+
+const spriteVBO = gl.createBuffer();
+
+function pushSprite(arr, st, k, alpha) {
+  // 尺寸参考用 max(W,H)：横屏下与 Apple 的 1.25×宽一致，竖窗也能铺满不露黑边
+  const S = Math.max(W, H);
+  const size = st.size[k] * S;
+  const [cx, cy] = st.pos[k];
+  const hx = size / 2, hy = size / 2;
+  // ⚠️ Apple 线上实现：轨道公转的小精灵显示自转取负号（i[2].rotation=-o[2]）——
+  // 自转与公转方向相反（逆行），texture 相对轨道「翻滚」，是它「水流感」的关键；
+  // aadishv 的还原版漏了这个负号（照抄会变成刚性转盘）。大精灵（0/1）不取负。
+  const rot = k >= 2 ? -st.rot[k] : st.rot[k];
+  const cos = Math.cos(rot), sin = Math.sin(rot);
+  // 本地四角（屏幕像素系，y 向下），旋转后平移；uv 与 FLIP_Y 上传配套（见 uploadTexture）
+  const local = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]];
+  const uvs = [[0, 1], [1, 1], [1, 0], [0, 0]];
+  const order = [0, 1, 2, 0, 2, 3];
+  for (const idx of order) {
+    const [lx, ly] = local[idx];
+    // +M：filter frame 出屏扩展（Apple 的 filter frame 同样大于视口）
+    arr.push(M + cx + lx * cos - ly * sin, M + cy + lx * sin + ly * cos, uvs[idx][0], uvs[idx][1], alpha);
+  }
+}
+
+/** 画一组精灵（一条轨）。预乘 over 混合（与 Pixi 一致）；
+    Apple 的换歌：旧精灵瞬间移除，新精灵以 mix 透明度在舞台底部的白色矩形上淡入
+    （srcA·cur + (1−srcA)·白底 = 从浅灰淡入），层内重叠为普通 over 不过曝 */
+function drawTrackGroup(st, alpha) {
+  const arr = [];
+  for (let k = 0; k < 4; k++) pushSprite(arr, st, k, alpha);
+  gl.bindBuffer(gl.ARRAY_BUFFER, spriteVBO);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(arr), gl.DYNAMIC_DRAW);
+  const stride = 20;
+  gl.enableVertexAttribArray(A.pos);
+  gl.vertexAttribPointer(A.pos, 2, gl.FLOAT, false, stride, 0);
+  gl.enableVertexAttribArray(A.uv);
+  gl.vertexAttribPointer(A.uv, 2, gl.FLOAT, false, stride, 8);
+  gl.enableVertexAttribArray(A.alpha);
+  gl.vertexAttribPointer(A.alpha, 1, gl.FLOAT, false, stride, 16);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, st.tex);
+  gl.uniform1i(U.tex, 0);
+  gl.uniform2f(U.res, FW, FH);
+  gl.drawArrays(gl.TRIANGLES, 0, arr.length / 5);
+}
+
+function compositePass(mix) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboComposite.fb);
+  gl.viewport(0, 0, fboComposite.w, fboComposite.h);
+  // Apple：舞台最底层是一个不透明白色矩形（constructor 里 beginFill(16777215)），
+  // 换歌时新流体在它上面淡入 —— 经过黑/白罩层后就是我们看到的「从浅灰淡入」
+  gl.clearColor(1, 1, 1, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(progSprite);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); // 预乘 over
+  if (curTrack) drawTrackGroup(curTrack, mix);
+  gl.disable(gl.BLEND);
+}
+
+function twistPass() {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboTwist.fb);
+  gl.viewport(0, 0, fboTwist.w, fboTwist.h);
+  gl.useProgram(progTwist);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboComposite.tex);
+  gl.uniform1i(TU.tex, 0);
+  // ⚠️ 必须是 frame 尺寸（FW,FH）而非视口尺寸：v_uv 覆盖整个 margin frame，
+  // 用视口尺寸会让扭曲中心偏移 (−M,−M)、漩涡眼跑到左上方
+  gl.uniform2f(TU.res, fboTwist.w, fboTwist.h);
+  gl.uniform2f(TU.center, M + W / 2, M + H / 2);
+  gl.uniform1f(TU.radius, P.radius);
+  // ⚠️ Pixi 的采样坐标是 y 向下（屏幕系），本管线 FBO 是 y 向上 —— 同一个角度两边
+  // 转向相反，必须取负才是 Apple 的旋向：旋涡剪切与大精灵顺时针自转协同（顺流），
+  // 不取负则旋涡逆着自转拧，水流观感拧巴
+  gl.uniform1f(TU.angle, -P.angle);
+  drawFullscreen(progTwist);
+}
+
+/** Apple 原链：5 个 Ee 滤镜 (strength 5/10/20/40/80, quality 1/1/2/2/2)。
+    Ee 语义：kernels = [blur, blur-blur/q, ...] 递减，每道 pass 偏移 = kernels[p]+0.5 纹素。
+    模糊倍率 = 各档 blur 同乘。 */
+const BLUR_CHAIN = [[5, 1], [10, 1], [20, 2], [40, 2], [80, 2]];
+function kernelsFor(blur, quality) {
+  const ks = [blur];
+  if (blur > 0) {
+    let r = blur;
+    const step = blur / quality;
+    for (let i = 1; i < quality; i++) { r -= step; ks.push(r); }
+  }
+  return ks;
+}
+function blurPass() {
+  const passes = [];
+  for (const [s, q] of BLUR_CHAIN) {
+    for (const k of kernelsFor(s * P.blurMul, q)) passes.push(k + 0.5);
+  }
+  gl.useProgram(progBlur);
+  let src = fboTwist;
+  for (let i = 0; i < passes.length; i++) {
+    const last = i === passes.length - 1;
+    let dst;
+    if (last) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, W, H);
+      // 从 frame 里裁出可视区域（frame 比视口四边大 M）
+      gl.uniform2f(BU.uv0, M / src.w, M / src.h);
+      gl.uniform2f(BU.uvScale, W / src.w, H / src.h);
+    } else {
+      dst = src === fboTmpA ? fboTmpB : fboTmpA;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb);
+      gl.viewport(0, 0, dst.w, dst.h);
+      gl.uniform2f(BU.uv0, 0, 0);
+      gl.uniform2f(BU.uvScale, 1, 1);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(BU.tex, 0);
+    gl.uniform2f(BU.texel, 1 / src.w, 1 / src.h);
+    gl.uniform1f(BU.off, passes[i]);
+    gl.uniform1f(BU.final, last ? 1 : 0);
+    gl.uniform1f(BU.sat, P.sat);
+    gl.uniform1f(BU.con, P.con);
+    gl.uniform1f(BU.bri, P.bri);
+    drawFullscreen(progBlur);
+    if (!last) src = dst;
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   3. 纹理上传 / 换歌交叉淡入 / 主循环
+   ════════════════════════════════════════════════════════════════════ */
+
+function uploadTexture(source) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  return tex;
+}
+
+const P = {
+  angle: -3.25,
+  radius: 900,
+  blurMul: 1, // 模糊倍率：Apple 原链 [5,10,20,40,80] 各档强度同乘，1 = 逐 pass 1:1
+  sat: 2.75,
+  con: 1.9,   // 对照 Apple 线上渲染脚本核对的参数：AdjustmentFilter
+  bri: 0.7,   // sat=2.75 + brightness=0.7 + contrast=1.9（此前公开资料只提到了饱和度）
+  speed: 1,
+  fade: 1650, // Apple 原版：每帧透明度 ±0.02 × 33.33ms ≈ 1.65s
+  fps15: true, // Apple 原版 ticker.maxFPS=15：流体背景 15fps 更新（步进感也是原版「水的质感」的一部分）
+  paused: false,
+};
+
+let curTrack = null;   // 当前曲精灵状态
+let fadeT = 1e9;       // 换歌淡入已进行时间(ms)（Apple：新精灵 alpha 0→1，从白底上浮现）
+let lastNow = performance.now();
+let fpsEMA = 60;
+let lastFrameWall = performance.now();
+
+function setTrack(def) {
+  if (def.url && !def.image) { loadUrlCover(def); return; }
+  applyTrack(def);
+}
+
+/** 在线封面（Apple CDN）：crossorigin 图像进 canvas（CDN 带 Access-Control-Allow-Origin: *，
+    纹理与 toDataURL 均不受污染），失败时给出明确提示 */
+function loadUrlCover(def) {
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    c.getContext('2d').drawImage(img, 0, 0);
+    applyTrack({ ...def, image: c });
+  };
+  img.onerror = () => {
+    document.getElementById('npTitle').textContent = def.title + '（封面加载失败）';
+    document.getElementById('npArtist').textContent = '需可访问 Apple CDN（mzstatic.com）';
+  };
+  img.src = def.url;
+}
+
+function applyTrack(def) {
+  // 纹理来源：Apple CDN 在线封面 / 本地导入图片（URL 曲目已先经 loadUrlCover 转为 canvas）
+  let source = def.image;
+  const thumbSource = source; // 播放界面封面用全尺寸
+  // ⚠️ Apple 线上页面 backdrop 组件的实际行为：
+  //   Go(artwork.url, { width: 40, height: 40, crop: 'bb', fileType: 'webp' })
+  //   传给 LyricsScene 的纹理是 40×40 的 webp 缩略图，不是封面原图！
+  // 40×40 色板放大 40 倍 = 天然无细节的纯色彩晕染 —— 「水墨感」的最终来源。
+  // 喂 600×600 原图会让细节穿透模糊层，观感就「不一样」。
+  const tiny = document.createElement('canvas');
+  tiny.width = 40; tiny.height = 40;
+  tiny.getContext('2d').drawImage(source, 0, 0, 40, 40);
+  source = tiny;
+  const tex = uploadTexture(source);
+  if (curTrack) gl.deleteTexture(curTrack.tex);
+  // Apple updateArtwork：旧精灵在换歌瞬间即被 removeChildren 移除（没有流体间交叉淡入），
+  // 新流体从舞台白色底矩形上淡入 —— 这里同样：直接换轨、淡入计数归零
+  curTrack = makeTrackState(tex);
+  fadeT = 0;
+  // 播放界面封面与曲名信息
+  const art = document.getElementById('npArt');
+  art.style.backgroundImage = `url("${thumbSource.toDataURL('image/jpeg', 0.85)}")`;
+  document.getElementById('npTitle').textContent = def.title || '本地图片';
+  document.getElementById('npArtist').textContent = def.artist || '拖入 / 粘贴的封面';
+  // 高亮曲目按钮（以标题匹配：在线封面经 loadUrlCover 复制后引用会变化）
+  document.querySelectorAll('#trackBtns button').forEach((b, i) => {
+    b.classList.toggle('on', TRACKS[i] && TRACKS[i].title === def.title);
+  });
+}
+
+let lastDraw = 0;
+const reduceMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+/** 状态推进：旋转/公转/淡入（dt = 毫秒，可为节流累积值）。
+    ⚠️ 线上版本行为：prefers-reduced-motion 时四层速度全部 +0.001（含逆行的 2/3 号，正负号照旧取反） */
+function tick(dt) {
+  const n = dt / 33.333;
+  if (curTrack) {
+    const slow = reduceMotionQuery.matches;
+    const v = slow ? [0.001, 0.001, 0.001, 0.001] : [0.003, -0.008, -0.006, 0.004].map(x => x * P.speed);
+    for (let k = 0; k < 4; k++) curTrack.rot[k] += v[k] * n;
+    curTrack.pos[0] = [W / 2, H / 2];
+    curTrack.pos[1] = [W / 2.5, H / 2.5];
+    curTrack.pos[2] = [
+      W / 2 + (W / 4) * Math.cos(curTrack.rot[2] * 0.75),
+      H / 2 + (W / 4) * Math.sin(curTrack.rot[2] * 0.75),
+    ];
+    curTrack.pos[3] = [
+      W / 2 + (W / 2) * 0.1 + (W / 4) * Math.cos(curTrack.rot[3] * 0.75),
+      H / 2 + (W / 2) * 0.1 + (W / 4) * Math.sin(curTrack.rot[3] * 0.75),
+    ];
+  }
+  if (fadeT < P.fade) fadeT = Math.min(P.fade, fadeT + dt);
+}
+/** 渲染：合成 → 扭曲 → 模糊+调色 → 屏幕 */
+function render() {
+  if (!(W > 0 && H > 0)) return;
+  const mix = P.fade > 0 ? Math.min(1, fadeT / P.fade) : 1;
+  compositePass(mix);
+  twistPass();
+  blurPass();
+}
+function frame(now) {
+  const wall = now - lastFrameWall;
+  if (wall > 0) fpsEMA = fpsEMA * 0.95 + (1000 / Math.max(1, wall)) * 0.05;
+  document.getElementById('fps').textContent = `FPS ${fpsEMA.toFixed(0)} · ${W}×${H}`;
+
+  // Apple 原版 15fps 节流：不到 66ms 就跳过本帧（只省渲染，dt 会把跳过的时间累积给 tick，
+  // 等价 Apple 的 h=deltaMS/33.33 补偿，转速不会因节流变慢）
+  if (P.fps15 && now - lastDraw < 62) {
+    requestAnimationFrame(frame);
+    return;
+  }
+  lastDraw = now;
+  const dt = Math.min(100, Math.max(0, now - lastNow));
+  lastNow = now;
+
+  if (!P.paused) tick(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   4. UI 装配
+   ════════════════════════════════════════════════════════════════════ */
+
+// 曲目按钮
+const trackBtns = document.getElementById('trackBtns');
+TRACKS.forEach((def, i) => {
+  const b = document.createElement('button');
+  const thumbSrc = def.url
+    ? def.url.replace('600x600bb', '100x100bb')
+    : '';
+  b.innerHTML = `<i style="background-image:url(&quot;${thumbSrc}&quot;)"></i><span>${i + 1}. ${def.title}</span>`;
+  b.addEventListener('click', () => setTrack(def));
+  trackBtns.appendChild(b);
+});
+
+// 滑杆绑定
+function bindSlider(id, outId, key, fmt) {
+  const el = document.getElementById(id);
+  const out = document.getElementById(outId);
+  const apply = () => {
+    P[key] = parseFloat(el.value);
+    out.textContent = fmt ? fmt(P[key]) : P[key];
+  };
+  el.addEventListener('input', apply);
+  apply();
+}
+bindSlider('pAngle', 'oAngle', 'angle', (v) => v.toFixed(2));
+bindSlider('pRadius', 'oRadius', 'radius', (v) => v.toFixed(0));
+bindSlider('pBlur', 'oBlur', 'blurMul', (v) => v.toFixed(2));
+bindSlider('pSat', 'oSat', 'sat', (v) => v.toFixed(2));
+bindSlider('pCon', 'oCon', 'con', (v) => v.toFixed(2));
+bindSlider('pBri', 'oBri', 'bri', (v) => v.toFixed(2));
+bindSlider('pSpeed', 'oSpeed', 'speed', (v) => v.toFixed(2));
+bindSlider('pFade', 'oFade', 'fade', (v) => v.toFixed(0));
+
+// 开关
+const tPause = document.getElementById('tPause');
+/** 播放/暂停图标与状态同步（界面按钮、面板按钮、空格共用）：播放中显示 ⏸，暂停时显示 ▶ */
+function syncPlayIcon() {
+  document.getElementById('iconPlay').style.display = P.paused ? '' : 'none';
+  document.getElementById('iconPause').style.display = P.paused ? 'none' : '';
+}
+function togglePause() {
+  P.paused = !P.paused;
+  tPause.classList.toggle('on', P.paused);
+  syncPlayIcon();
+  lastNow = performance.now(); // 恢复时避免 dt 巨大跳帧
+}
+tPause.addEventListener('click', togglePause);
+document.getElementById('btnPlay').addEventListener('click', togglePause);
+document.getElementById('btnClose').addEventListener('click', () => {
+  document.body.classList.add('no-ui');
+  tUi.classList.remove('on');
+});
+
+const tFps15 = document.getElementById('tFps15');
+tFps15.addEventListener('click', () => {
+  P.fps15 = !P.fps15;
+  tFps15.classList.toggle('on', P.fps15);
+});
+
+const tUi = document.getElementById('tUi');
+tUi.addEventListener('click', () => {
+  document.body.classList.toggle('no-ui');
+  tUi.classList.toggle('on', !document.body.classList.contains('no-ui'));
+});
+
+const tHide = document.getElementById('tHide');
+tHide.addEventListener('click', () => document.body.classList.add('panel-off'));
+document.getElementById('panelToggle').addEventListener('click', () => document.body.classList.remove('panel-off'));
+
+// 本地图片
+document.getElementById('btnOpen').addEventListener('click', () => document.getElementById('fileInput').click());
+document.getElementById('fileInput').addEventListener('change', (e) => {
+  const f = e.target.files[0];
+  if (f) loadLocalImage(f);
+});
+
+function loadLocalImage(file) {
+  const img = new Image();
+  img.onload = () => {
+    // 限制纹理尺寸，4K 图也没压力
+    const M = 1024;
+    const sc = Math.min(1, M / Math.max(img.width, img.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.width * sc);
+    c.height = Math.round(img.height * sc);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    setTrack({ image: c, title: file.name.replace(/\.[^.]+$/, ''), artist: '本地封面' });
+  };
+  img.src = URL.createObjectURL(file);
+}
+
+// 拖拽 + 粘贴
+window.addEventListener('dragover', (e) => { e.preventDefault(); document.body.classList.add('dropping'); });
+window.addEventListener('dragleave', (e) => { if (!e.relatedTarget) document.body.classList.remove('dropping'); });
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  document.body.classList.remove('dropping');
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f && f.type.startsWith('image/')) loadLocalImage(f);
+});
+window.addEventListener('paste', (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const it of items) {
+    if (it.type.startsWith('image/')) {
+      loadLocalImage(it.getAsFile());
+      break;
+    }
+  }
+});
+
+// 快捷键
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+  else if (e.key >= '0' && e.key <= '9') {
+    const idx = e.key === '0' ? 9 : +e.key - 1;
+    if (TRACKS[idx]) setTrack(TRACKS[idx]);
+  }
+  else if (e.key === 'h' || e.key === 'H') document.body.classList.toggle('panel-off');
+});
+
+/* ════════════════════════════════════════════════════════════════════
+   5. 启动
+   ════════════════════════════════════════════════════════════════════ */
+
+resize();
+setTrack(TRACKS[0]);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
